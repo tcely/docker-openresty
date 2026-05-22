@@ -1,0 +1,127 @@
+name: CI
+
+env:
+  IMAGE_NAME: openresty
+  REGISTRY: ghcr.io
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+      - 'test-*'
+  pull_request:
+    branches:
+      - 'main'
+      - 'test-*'
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  info:
+    runs-on: ubuntu-slim
+    outputs:
+      IMAGE_NAME: ${{ env.IMAGE_NAME }}
+      REGISTRY: ${{ env.REGISTRY }}
+      lowercase-github-actor: ${{ steps.github-actor.outputs.lowercase }}
+      lowercase-github-repository_owner: ${{ steps.github-repository_owner.outputs.lowercase }}
+    steps:
+      - name: Lowercase github username
+        id: github-actor
+        uses: meeb/tubesync/.github/actions/string-case@v0.17.3
+        with:
+          string: ${{ github.actor }}
+      - name: Lowercase github repository owner
+        id: github-repository_owner
+        uses: meeb/tubesync/.github/actions/string-case@v0.17.3
+        with:
+          string: ${{ github.repository_owner }}
+
+  containerise:
+    if: ${{ !cancelled() && 'success' == needs.info.result }}
+    needs: ['info']
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    concurrency:
+      group: ${{ github.repository }}-${{ github.workflow }}
+      cancel-in-progress: false
+    steps:
+      - name: Set up QEMU
+        id: qemu
+        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=10485760
+      - name: Build image for `dive`
+        id: build-dive-image
+        uses: docker/build-push-action@v7
+        with:
+          file: restyrepo/Dockerfile
+          build-args: |
+            IMAGE_NAME=${{ env.IMAGE_NAME }}
+            RESTY_J=4
+          cache-from: type=gha,scope=buildkit-linux-s390x
+          load: true
+          platforms: linux/s390x
+          push: false
+          tags: ghcr.io/${{ needs.info.outputs.lowercase-github-repository_owner }}/${{ env.IMAGE_NAME }}:dive
+      - name: Analysis with `dive`
+        continue-on-error: false
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            'ghcr.io/wagoodman/dive' \
+            'ghcr.io/${{ needs.info.outputs.lowercase-github-repository_owner }}/${{ env.IMAGE_NAME }}:dive' \
+            --ci \
+            --highestUserWastedPercent '0.08' \
+            --highestWastedBytes '50M'
+
+  docker-image:
+    if: ${{ !cancelled() && 'success' == needs.info.result && 'success' == needs.containerise.result }}
+    concurrency:
+      group: ${{ github.repository }}-${{ github.workflow }}
+      cancel-in-progress: false
+    needs: ['info', 'containerise']
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read # to fetch the repository content
+      id-token: write # for signing attestation(s) with GitHub OIDC Token
+      packages: write # to push containers
+    secrets:
+      registry-auths: |
+        - registry: ${{ needs.info.outputs.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+    with:
+      runner: |
+        default=ubuntu-24.04-arm
+        linux/amd64=ubuntu-24.04
+      cache: true
+      cache-mode: max
+      file: restyrepo/Dockerfile
+      meta-images: ${{ needs.info.outputs.REGISTRY }}/${{ needs.info.outputs.lowercase-github-repository_owner }}/${{ needs.info.outputs.IMAGE_NAME }}
+      output: image
+      platforms: linux/amd64,linux/arm64,linux/s390x
+      push: ${{ 'tcely' == github.repository_owner && 'pull_request' != github.event_name }}
+      setup-qemu: true
+      meta-flavor: |
+        latest=false
+      meta-tags: |
+        type=schedule,pattern=weekly
+        type=raw,enable={{is_default_branch}},value=latest
+        type=raw,enable={{is_not_default_branch}},value=test
+        type=ref,event=tag
+        type=ref,event=pr
+      build-args: |
+        IMAGE_NAME=${{ needs.info.outputs.IMAGE_NAME }}
+        RESTY_J=4
